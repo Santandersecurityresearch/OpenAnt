@@ -52,7 +52,7 @@ jobs:
           # --limit 50:          cost guard — cap at 50 units per scan
           # --no-report:         skip HTML/CSV report generation (saves time on PR scans)
           # --workers 8:         parallelise LLM calls
-          openant scan "$GITHUB_WORKSPACE" \
+          openant --api-key "$ANTHROPIC_API_KEY" scan "$GITHUB_WORKSPACE" \
             --language auto \
             --output /tmp/openant-results \
             --level reachable \

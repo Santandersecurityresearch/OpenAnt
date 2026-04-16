@@ -70,7 +70,7 @@ jobs:
           # --model opus:       most capable model for highest confidence
           # --workers 8:        parallel LLM calls
           # (no --no-report)    generate HTML + CSV + summary reports
-          openant scan "$GITHUB_WORKSPACE" \
+          openant --api-key "$ANTHROPIC_API_KEY" scan "$GITHUB_WORKSPACE" \
             --language "$LANGUAGE" \
             --output /tmp/openant-audit \
             --level "$LEVEL" \

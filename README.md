@@ -34,11 +34,52 @@ Research and ideation: [Nahum Korda](https://github.com/NahumKorda/).
 
 Productization: Alex Raihelgaus, Daniel Geyshis.
 
-With thanks to: [Michal Kamensky](https://github.com/kamenskymic/), [Imri Goldberg](https://github.com/lorg), [Gadi Evron](https://github.com/gadievron/), Daniel Cuthbert. Josh Grossman, and Avi Douglen.
+With thanks to: [Michal Kamensky](https://github.com/kamenskymic/), [Imri Goldberg](https://github.com/lorg), [Gadi Evron](https://github.com/gadievron/), [Daniel Cuthbert](https://github.com/danielcuthbert/). Josh Grossman, and Avi Douglen.
 
 ## Check out Knostic
 **If you like our work**, check out what we do at [Knostic](https://knostic.ai) to defend your agents and coding assistants, prevent them from deleting your hard drive and code, and control associated supply chain risks such as MCP servers, extensions, and skills.
 
+
+## GitHub Actions integration
+
+OpenAnt ships with two workflows and a reusable composite action for running scans in CI/CD pipelines.
+
+### Workflows
+
+**`openant-pr-scan.yml`** — runs on every pull request targeting `main` or `master`. It scans only the units reachable from user input (`--level reachable`), uses Stage 2 attacker simulation to eliminate false positives, and posts a summary comment directly on the PR. The check fails if any confirmed vulnerabilities are found. A cost guard (`--limit 50`) caps spend at roughly $5-10 per run using the Sonnet model.
+
+**`openant-nightly.yml`** — runs a full audit on a weekly schedule (Monday 02:00 UTC) or on demand via `workflow_dispatch`. It uses the Opus model with agentic enhancement and generates all report formats (HTML, CSV, summary). Results are uploaded as workflow artefacts with 90-day retention, SARIF is pushed to the Security tab, and a GitHub issue is opened automatically if confirmed findings are present.
+
+### Setup action
+
+`.github/actions/setup-openant/action.yml` is a composite action that handles the full install: Go toolchain, Python dependencies, and building the `openant` binary. Both workflows call it to keep setup DRY. Go modules and pip packages are cached between runs.
+
+### SARIF converter
+
+`tools/sarif_convert.py` converts `pipeline_output.json` to SARIF 2.1.0 so findings appear in the **Security > Code scanning** tab with CWE rule metadata, severity labels, and stable fingerprints for deduplication across scans. Only actionable findings (`vulnerable`, `bypassable`, `inconclusive`) are emitted; `protected` and `safe` results are omitted to keep the Security tab signal-rich.
+
+### Required secret
+
+Add your Anthropic API key as a repository secret before the workflows will run:
+
+```
+Settings > Secrets and variables > Actions > New repository secret
+Name:  ANTHROPIC_API_KEY
+Value: sk-ant-...
+```
+
+### What a PR scan produces
+
+When a pull request is opened or updated, the workflow:
+
+1. Parses the repository and filters to entry-point-reachable units (typically a 90-95% reduction in units analysed).
+2. Runs Stage 1 detection against each unit using Claude Sonnet.
+3. Runs Stage 2 attacker simulation on any `vulnerable` or `bypassable` findings to confirm exploitability.
+4. Posts a comment on the PR with a verdict table and finding list.
+5. Uploads a SARIF file to the Security tab with per-finding CWE annotations.
+6. Fails the check if any confirmed vulnerabilities are found; `bypassable` findings raise a warning but do not block by default.
+
+---
 
 ## Local setup
 

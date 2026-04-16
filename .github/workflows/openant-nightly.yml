@@ -94,9 +94,8 @@ jobs:
             python tools/sarif_convert.py "$PIPELINE_OUTPUT" \
               -o /tmp/openant-audit/results.sarif
           else
-            cat > /tmp/openant-audit/results.sarif <<'SARIF'
-          {"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"OpenAnt","version":"1.0.0","rules":[]}},"results":[]}]}
-          SARIF
+            printf '{"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"OpenAnt","version":"1.0.0","rules":[]}},"results":[]}]}\n' \
+              > /tmp/openant-audit/results.sarif
           fi
 
       - name: Upload SARIF to GitHub Security tab

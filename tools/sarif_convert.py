@@ -50,7 +50,7 @@ _VERDICT_TO_SECURITY_SEVERITY: dict[str, str] = {
 def _rule_id(finding: dict) -> str:
     """Stable rule ID from CWE number, e.g. 'CWE-78'."""
     cwe = finding.get("cwe_id")
-    if cwe:
+    if cwe and int(cwe) > 0:
         return f"CWE-{cwe}"
     return f"openant/{finding['short_name'].lower().replace(' ', '-')}"
 
@@ -60,7 +60,7 @@ def _finding_to_result(finding: dict, repo_root: str) -> dict[str, Any]:
     location = finding.get("location", {})
     file_path = location.get("file", "")
     function_name = location.get("function", "")
-    verdict = finding.get("stage1_verdict", "inconclusive")
+    verdict = finding.get("stage1_verdict", "inconclusive").lower()
     level = _VERDICT_TO_LEVEL.get(verdict, "note")
 
     # Build a helpful message that includes all useful context.
@@ -101,7 +101,7 @@ def _finding_to_result(finding: dict, repo_root: str) -> dict[str, Any]:
         "properties": {
             "security-severity": _VERDICT_TO_SECURITY_SEVERITY.get(verdict, "medium"),
             "openant/stage1_verdict": verdict,
-            "openant/stage2_verdict": finding.get("stage2_verdict", ""),
+            "openant/stage2_verdict": finding.get("stage2_verdict", "").lower(),
             "openant/cwe_name": finding.get("cwe_name", ""),
         },
     }
@@ -140,7 +140,7 @@ def _finding_to_rule(finding: dict) -> dict[str, Any]:
     """Map a finding to the SARIF rules/reportingDescriptors entry."""
     cwe_id = finding.get("cwe_id")
     cwe_name = finding.get("cwe_name", "")
-    verdict = finding.get("stage1_verdict", "inconclusive")
+    verdict = finding.get("stage1_verdict", "inconclusive").lower()
     security_severity = _VERDICT_TO_SECURITY_SEVERITY.get(verdict, "medium")
 
     rule: dict[str, Any] = {
@@ -185,10 +185,11 @@ def convert(pipeline_output: dict) -> dict[str, Any]:
     commit_sha = repo.get("commit_sha", "")
 
     # Only emit actionable findings (drop protected/safe).
+    # Normalise verdict to lowercase before comparing.
     actionable_verdicts = set(_VERDICT_TO_LEVEL.keys())
     findings = [
         f for f in pipeline_output.get("findings", [])
-        if f.get("stage1_verdict") in actionable_verdicts
+        if f.get("stage1_verdict", "").lower() in actionable_verdicts
     ]
 
     # Deduplicate rules by rule ID.

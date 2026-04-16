@@ -1,0 +1,59 @@
+name: Setup OpenAnt
+description: >
+  Composite action: installs Go + Python, builds the openant CLI binary,
+  installs Python core dependencies, and adds the binary to PATH.
+  Caches both the Go module cache and the Python package cache between runs.
+
+inputs:
+  python-version:
+    description: Python version to install
+    default: '3.11'
+  go-version-file:
+    description: Path to go.mod (used to pin Go version)
+    default: apps/openant-cli/go.mod
+
+outputs:
+  openant-bin:
+    description: Absolute path to the compiled openant binary
+    value: ${{ steps.build.outputs.bin-path }}
+
+runs:
+  using: composite
+
+  steps:
+    # ------------------------------------------------------------------ Go
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: ${{ inputs.go-version-file }}
+        cache-dependency-path: apps/openant-cli/go.sum
+
+    # ------------------------------------------------------------------ Python
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: pip
+        cache-dependency-path: libs/openant-core/requirements.txt
+
+    - name: Install Python dependencies
+      shell: bash
+      run: |
+        pip install --quiet -r libs/openant-core/requirements.txt
+
+    # ------------------------------------------------------------------ Build CLI
+    - name: Build openant CLI
+      id: build
+      shell: bash
+      run: |
+        cd apps/openant-cli
+        go build -o bin/openant .
+        BIN_PATH="$(pwd)/bin/openant"
+        echo "bin-path=${BIN_PATH}" >> "$GITHUB_OUTPUT"
+        echo "$(pwd)/bin" >> "$GITHUB_PATH"
+        echo "openant binary built: ${BIN_PATH}"
+
+    # ------------------------------------------------------------------ Smoke test
+    - name: Verify openant is runnable
+      shell: bash
+      run: openant version

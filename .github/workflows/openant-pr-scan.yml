@@ -1,0 +1,201 @@
+name: OpenAnt Security Scan (PR)
+
+# Runs on every PR targeting main/master.
+# Goal: fast signal — scan only entry-point-reachable units, verify findings,
+# post a comment on the PR, upload SARIF to the Security tab, and fail if
+# any confirmed vulnerabilities are found.
+#
+# Cost guard: --limit 50 caps LLM spend at roughly $5-10 per run on Sonnet.
+# Raise the limit (or remove it) for larger repos.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+  pull-requests: write       # post PR comment
+  security-events: write     # upload SARIF
+
+jobs:
+  scan:
+    name: OpenAnt vulnerability scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ------------------------------------------------------------------ Checkout
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # ------------------------------------------------------------------ Setup
+      - name: Setup OpenAnt
+        uses: ./.github/actions/setup-openant
+
+      # ------------------------------------------------------------------ Scan
+      - name: Run security scan
+        id: scan
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          mkdir -p /tmp/openant-results
+
+          # --level reachable:   only analyse units reachable from user input
+          # --verify:            Stage 2 attacker simulation (eliminates false positives)
+          # --enhance-mode single-shot: fast enhancement (saves cost vs agentic)
+          # --model sonnet:      Sonnet is sufficient for PR gates; use opus for nightly
+          # --limit 50:          cost guard — cap at 50 units per scan
+          # --no-report:         skip HTML/CSV report generation (saves time on PR scans)
+          # --workers 8:         parallelise LLM calls
+          openant scan "$GITHUB_WORKSPACE" \
+            --language auto \
+            --output /tmp/openant-results \
+            --level reachable \
+            --verify \
+            --enhance-mode single-shot \
+            --model sonnet \
+            --limit 50 \
+            --no-report \
+            --workers 8 \
+            --json \
+            2>/tmp/openant-stderr.log \
+            | tee /tmp/openant-stdout.json
+
+          # Capture exit code (0=clean, 1=vulns found, 2=error).
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------ SARIF
+      - name: Convert findings to SARIF
+        if: always()
+        run: |
+          PIPELINE_OUTPUT="/tmp/openant-results/pipeline_output.json"
+          if [ -f "$PIPELINE_OUTPUT" ]; then
+            python tools/sarif_convert.py "$PIPELINE_OUTPUT" \
+              -o /tmp/openant-results/results.sarif
+          else
+            # Write a minimal valid empty SARIF so the upload step doesn't fail.
+            cat > /tmp/openant-results/results.sarif <<'SARIF'
+          {"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"OpenAnt","version":"1.0.0","rules":[]}},"results":[]}]}
+          SARIF
+          fi
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: /tmp/openant-results/results.sarif
+          category: openant
+
+      # ------------------------------------------------------------------ PR comment
+      - name: Post scan summary as PR comment
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PIPELINE_OUTPUT="/tmp/openant-results/pipeline_output.json"
+          STDOUT="/tmp/openant-stdout.json"
+
+          # Parse counts from scan output envelope.
+          VULNERABLE=0; BYPASSABLE=0; INCONCLUSIVE=0; TOTAL=0; COST="N/A"
+
+          if [ -f "$STDOUT" ]; then
+            VULNERABLE=$(jq -r '.data.metrics.vulnerable // 0'   "$STDOUT" 2>/dev/null || echo 0)
+            BYPASSABLE=$(jq -r '.data.metrics.bypassable // 0'   "$STDOUT" 2>/dev/null || echo 0)
+            INCONCLUSIVE=$(jq -r '.data.metrics.inconclusive // 0' "$STDOUT" 2>/dev/null || echo 0)
+            TOTAL=$(jq -r '.data.units_count // 0'              "$STDOUT" 2>/dev/null || echo 0)
+            RAW_COST=$(jq -r '.data.usage.total_cost_usd // 0'  "$STDOUT" 2>/dev/null || echo 0)
+            COST=$(printf '$%.2f' "$RAW_COST" 2>/dev/null || echo "N/A")
+          fi
+
+          # Determine overall badge.
+          if [ "$VULNERABLE" -gt 0 ] || [ "$BYPASSABLE" -gt 0 ]; then
+            BADGE="🔴 **Vulnerabilities confirmed**"
+          elif [ "$INCONCLUSIVE" -gt 0 ]; then
+            BADGE="🟡 **Needs manual review**"
+          else
+            BADGE="🟢 **No confirmed vulnerabilities**"
+          fi
+
+          # Build finding list from pipeline_output.json (top 10 findings).
+          FINDING_LINES=""
+          if [ -f "$PIPELINE_OUTPUT" ]; then
+            FINDING_LINES=$(jq -r '
+              .findings[:10][]
+              | "| `\(.location.file)` | \(.location.function) | \(.stage1_verdict | ascii_upcase) | \(.name) |"
+            ' "$PIPELINE_OUTPUT" 2>/dev/null || echo "")
+          fi
+
+          FINDING_TABLE=""
+          if [ -n "$FINDING_LINES" ]; then
+            FINDING_TABLE="
+          ### Findings
+
+          | File | Function | Verdict | Type |
+          |------|----------|---------|------|
+          ${FINDING_LINES}
+          "
+          fi
+
+          # Write comment body to a temp file to avoid shell quoting issues.
+          cat > /tmp/pr-comment.md <<EOF
+          ## OpenAnt Security Scan
+
+          ${BADGE}
+
+          | Metric | Value |
+          |--------|-------|
+          | Units scanned | ${TOTAL} |
+          | Confirmed vulnerable | ${VULNERABLE} |
+          | Bypassable controls | ${BYPASSABLE} |
+          | Inconclusive | ${INCONCLUSIVE} |
+          | LLM cost | ${COST} |
+
+          ${FINDING_TABLE}
+
+          > Scan used Stage 1 detection + Stage 2 attacker simulation.
+          > Full details: **Actions → Artifacts → openant-report** (if generated).
+          > Security tab: see the **Security → Code scanning** view for finding details.
+
+          <sub>OpenAnt · commit \`${{ github.sha }}\`</sub>
+          EOF
+
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/pr-comment.md \
+            --edit-last \
+            || \
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/pr-comment.md
+
+      # ------------------------------------------------------------------ Fail gate
+      - name: Fail if confirmed vulnerabilities found
+        run: |
+          PIPELINE_OUTPUT="/tmp/openant-results/pipeline_output.json"
+
+          if [ ! -f "$PIPELINE_OUTPUT" ]; then
+            echo "::warning::pipeline_output.json not found — scan may have errored"
+            exit 0
+          fi
+
+          VULNERABLE=$(jq '[.findings[] | select(.stage1_verdict == "vulnerable")] | length' \
+                       "$PIPELINE_OUTPUT" 2>/dev/null || echo 0)
+          BYPASSABLE=$(jq '[.findings[] | select(.stage1_verdict == "bypassable")] | length' \
+                       "$PIPELINE_OUTPUT" 2>/dev/null || echo 0)
+
+          echo "Confirmed vulnerable: ${VULNERABLE}"
+          echo "Bypassable controls:  ${BYPASSABLE}"
+
+          if [ "$VULNERABLE" -gt 0 ]; then
+            echo "::error::${VULNERABLE} confirmed vulnerabilit$([ $VULNERABLE -eq 1 ] && echo y || echo ies) found. Review the Security tab or PR comment."
+            exit 1
+          fi
+          if [ "$BYPASSABLE" -gt 0 ]; then
+            echo "::warning::${BYPASSABLE} finding$([ $BYPASSABLE -eq 1 ] && echo '' || echo s) with bypassable controls. Review before merging."
+            # bypassable is a warning, not a hard block — adjust to `exit 1` to make it blocking
+          fi

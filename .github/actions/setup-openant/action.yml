@@ -2,7 +2,8 @@ name: Setup OpenAnt
 description: >
   Composite action: installs Go + Python, builds the openant CLI binary,
   installs Python core dependencies, and adds the binary to PATH.
-  Caches both the Go module cache and the Python package cache between runs.
+  Caches the compiled binary (keyed on Go source hash), the Go module
+  cache, and the Python package cache between runs.
 
 inputs:
   python-version:
@@ -42,16 +43,31 @@ runs:
         pip install --quiet -r libs/openant-core/requirements.txt
 
     # ------------------------------------------------------------------ Build CLI
+    # Cache the compiled binary — key includes OS and a hash of all Go source
+    # files + go.sum so the cache is invalidated on any code change.
+    - name: Cache openant binary
+      id: cache-bin
+      uses: actions/cache@v4
+      with:
+        path: apps/openant-cli/bin
+        key: openant-bin-${{ runner.os }}-${{ hashFiles('apps/openant-cli/**/*.go', 'apps/openant-cli/go.sum') }}
+        restore-keys: |
+          openant-bin-${{ runner.os }}-
+
     - name: Build openant CLI
       id: build
       shell: bash
       run: |
         cd apps/openant-cli
-        go build -o bin/openant .
+        if [ "${{ steps.cache-bin.outputs.cache-hit }}" != "true" ]; then
+          go build -o bin/openant .
+          echo "Built openant binary from source."
+        else
+          echo "Restored openant binary from cache (skipping build)."
+        fi
         BIN_PATH="$(pwd)/bin/openant"
         echo "bin-path=${BIN_PATH}" >> "$GITHUB_OUTPUT"
         echo "$(pwd)/bin" >> "$GITHUB_PATH"
-        echo "openant binary built: ${BIN_PATH}"
 
     # ------------------------------------------------------------------ Smoke test
     - name: Verify openant is runnable

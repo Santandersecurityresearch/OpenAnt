@@ -1,18 +1,23 @@
 name: OpenAnt Security Audit (Nightly)
 
 # Full-repo audit: every function scanned, Opus model, agentic enhancement,
-# Stage 2 verification. Runs nightly and can be triggered manually.
+# Stage 2 verification. Runs Monday and Wednesday; can be triggered manually.
 #
-# This is the thorough scan — expect 60-180 minutes and $50-150 in API cost
-# for a medium-sized repo. Use the PR scan for routine CI feedback.
+# Supports matrix scanning: pass a JSON array of languages to run a separate
+# parallel audit job per language (e.g. '["python","go"]').
+# Default is a single auto-detected pass ("auto").
+#
+# Expect 60-180 minutes and $50-150 per language job on a medium-sized repo.
 
 on:
   schedule:
-    - cron: '0 2 * * 1'   # Monday 02:00 UTC
+    - cron: '0 2 * * 1,3'   # Monday + Wednesday 02:00 UTC
   workflow_dispatch:
     inputs:
-      language:
-        description: 'Override language detection (python/javascript/go/auto)'
+      languages:
+        description: >
+          Language(s) to scan — JSON array or single value.
+          Examples: auto  |  python  |  ["python","go","javascript"]
         required: false
         default: 'auto'
       level:
@@ -20,9 +25,13 @@ on:
         required: false
         default: 'reachable'
       limit:
-        description: 'Max units to analyse (0 = no limit)'
+        description: 'Max units to analyse per language job (0 = no limit)'
         required: false
         default: '0'
+      cost_threshold_usd:
+        description: 'Warn at 80%, fail above this cost per language job (USD)'
+        required: false
+        default: '100'
 
 permissions:
   contents: read
@@ -30,10 +39,39 @@ permissions:
   issues: write            # open issue on failure
 
 jobs:
+  # ------------------------------------------------------------------ Matrix setup
+  # Normalises the `languages` input (single string or JSON array) into a JSON
+  # array consumed by the matrix strategy in the audit job.
+  setup-matrix:
+    name: Resolve language matrix
+    runs-on: ubuntu-latest
+    outputs:
+      languages: ${{ steps.resolve.outputs.languages }}
+    steps:
+      - name: Resolve language matrix
+        id: resolve
+        run: |
+          RAW="${{ github.event.inputs.languages || 'auto' }}"
+          # If the value already looks like a JSON array, use it directly.
+          if echo "$RAW" | grep -qE '^\['; then
+            LANGS="$RAW"
+          else
+            LANGS="[\"${RAW}\"]"
+          fi
+          echo "languages=${LANGS}" >> "$GITHUB_OUTPUT"
+          echo "Matrix languages: ${LANGS}"
+
+  # ------------------------------------------------------------------ Audit
   audit:
-    name: Full security audit
+    name: Full security audit (${{ matrix.language }})
+    needs: setup-matrix
     runs-on: ubuntu-latest
     timeout-minutes: 240
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(needs.setup-matrix.outputs.languages) }}
 
     steps:
       # ------------------------------------------------------------------ Checkout
@@ -55,7 +93,7 @@ jobs:
         run: |
           mkdir -p /tmp/openant-audit
 
-          LANGUAGE="${{ github.event.inputs.language || 'auto' }}"
+          LANGUAGE="${{ matrix.language }}"
           LEVEL="${{ github.event.inputs.level || 'reachable' }}"
           LIMIT="${{ github.event.inputs.limit || '0' }}"
 
@@ -64,12 +102,6 @@ jobs:
             EXTRA_ARGS="--limit $LIMIT"
           fi
 
-          # --level reachable:  entry-point-reachable units (swap to 'all' for exhaustive)
-          # --verify:           Stage 2 attacker simulation
-          # --enhance-mode agentic: thorough call-path analysis (more accurate than single-shot)
-          # --model opus:       most capable model for highest confidence
-          # --workers 8:        parallel LLM calls
-          # (no --no-report)    generate HTML + CSV + summary reports
           openant --api-key "$ANTHROPIC_API_KEY" scan "$GITHUB_WORKSPACE" \
             --language "$LANGUAGE" \
             --output /tmp/openant-audit \
@@ -103,14 +135,15 @@ jobs:
         if: always()
         with:
           sarif_file: /tmp/openant-audit/results.sarif
-          category: openant-nightly
+          # Include language in category so multi-language runs get separate entries
+          category: openant-nightly-${{ matrix.language }}
 
       # ------------------------------------------------------------------ Artifacts
       - name: Upload full audit artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: openant-audit-${{ github.sha }}
+          name: openant-audit-${{ matrix.language }}-${{ github.sha }}
           path: |
             /tmp/openant-audit/report.html
             /tmp/openant-audit/report.csv
@@ -131,7 +164,7 @@ jobs:
             exit 0
           fi
 
-          echo "## Audit Summary"
+          echo "## Audit Summary — ${{ matrix.language }}"
           echo ""
           echo "Units scanned:  $(jq -r '.data.units_count // "N/A"' "$STDOUT")"
           echo "Vulnerable:     $(jq -r '.data.metrics.vulnerable // "N/A"' "$STDOUT")"
@@ -143,6 +176,30 @@ jobs:
           echo "Total API cost: \$$(jq -r '.data.usage.total_cost_usd // "N/A"' "$STDOUT")"
           echo "Input tokens:   $(jq -r '.data.usage.total_input_tokens // "N/A"' "$STDOUT")"
           echo "Output tokens:  $(jq -r '.data.usage.total_output_tokens // "N/A"' "$STDOUT")"
+
+      # ------------------------------------------------------------------ Cost alert
+      # Emit a warning annotation at 80% of threshold; hard-fail above it.
+      - name: Check scan cost against threshold
+        if: always()
+        run: |
+          STDOUT="/tmp/openant-audit/stdout.json"
+          THRESHOLD="${{ github.event.inputs.cost_threshold_usd || '100' }}"
+
+          if [ ! -f "$STDOUT" ]; then exit 0; fi
+
+          COST=$(jq -r '.data.usage.total_cost_usd // 0' "$STDOUT" 2>/dev/null || echo 0)
+
+          OVER=$(awk -v c="$COST" -v t="$THRESHOLD" 'BEGIN { print (c+0 > t+0) ? 1 : 0 }')
+          WARN=$(awk -v c="$COST" -v t="$THRESHOLD" 'BEGIN { print (c+0 > t*0.8) ? 1 : 0 }')
+
+          if [ "$OVER" = "1" ]; then
+            echo "::error::[${{ matrix.language }}] Scan cost \$${COST} exceeded threshold \$${THRESHOLD}. Consider reducing --limit or scope."
+            exit 1
+          elif [ "$WARN" = "1" ]; then
+            echo "::warning::[${{ matrix.language }}] Scan cost \$${COST} is above 80% of the \$${THRESHOLD} threshold."
+          else
+            echo "[${{ matrix.language }}] Scan cost \$${COST} is within the \$${THRESHOLD} threshold."
+          fi
 
       # ------------------------------------------------------------------ Open issue on findings
       - name: Open GitHub issue if vulnerabilities confirmed
@@ -165,7 +222,6 @@ jobs:
             exit 0
           fi
 
-          # Build finding table for issue body (up to 20 findings).
           FINDING_ROWS=$(jq -r '
             .findings[:20][]
             | select(.stage1_verdict == "vulnerable" or .stage1_verdict == "bypassable")
@@ -181,8 +237,11 @@ jobs:
           ${FINDING_ROWS}"
           fi
 
+          LANG="${{ matrix.language }}"
+          LANG_TAG=$([ "$LANG" = "auto" ] && echo "" || echo " [${LANG}]")
+
           cat > /tmp/issue-body.md <<EOF
-          ## OpenAnt Nightly Audit — $(date -u '+%Y-%m-%d')
+          ## OpenAnt Nightly Audit${LANG_TAG} — $(date -u '+%Y-%m-%d')
 
           The scheduled security audit found **${VULNERABLE}** confirmed vulnerabilit$([ $VULNERABLE -eq 1 ] && echo y || echo ies) and **${BYPASSABLE}** finding$([ $BYPASSABLE -eq 1 ] && echo '' || echo s) with bypassable controls.
 
@@ -193,12 +252,11 @@ jobs:
           Full report and SARIF are available as workflow artifacts (retained for 90 days).
           See the [Security → Code scanning](${{ github.server_url }}/${{ github.repository }}/security/code-scanning) view for annotated findings.
 
-          <sub>Opened automatically by OpenAnt nightly audit · commit \`${{ github.sha }}\`</sub>
+          <sub>Opened automatically by OpenAnt nightly audit · language: \`${{ matrix.language }}\` · commit \`${{ github.sha }}\`</sub>
           EOF
 
-          TITLE="[OpenAnt] Security findings — $(date -u '+%Y-%m-%d') (${VULNERABLE} vulnerable, ${BYPASSABLE} bypassable)"
+          TITLE="[OpenAnt] Security findings${LANG_TAG} — $(date -u '+%Y-%m-%d') (${VULNERABLE} vulnerable, ${BYPASSABLE} bypassable)"
 
-          # Only open a new issue if one with the same title doesn't exist today.
           EXISTING=$(gh issue list \
             --repo "${{ github.repository }}" \
             --state open \

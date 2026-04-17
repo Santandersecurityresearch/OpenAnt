@@ -1,0 +1,39 @@
+# .openant-suppress.yml
+# Suppress known/accepted OpenAnt findings so they don't block PR gates.
+#
+# Each entry must have EITHER fingerprint, rule, OR path_prefix (first match wins)
+# plus a mandatory `reason` and `added_by` / `added_date` for audit purposes.
+# Add an `expires` date (ISO 8601) to auto-reinstate the finding after review.
+#
+# Matching rules:
+#   fingerprint  — exact match on finding id OR "file:function" location string
+#   rule         — matches CWE-NNN rule id or finding short_name
+#   path_prefix  — matches any finding whose location.file starts with this prefix
+#
+# Version history is tracked by git; delete an entry to reinstate the finding.
+
+version: 1
+
+suppressions: []
+
+# Examples (uncomment and adapt as needed):
+#
+# Suppress a specific function by location fingerprint:
+#   - fingerprint: "src/auth/login.py:authenticate_user"
+#     reason: "Rate-limited at the API gateway layer; exploit path not reachable in production"
+#     expires: "2026-12-31"
+#     added_by: "daniel"
+#     added_date: "2026-04-17"
+#
+# Suppress all inconclusive findings in a legacy module pending refactor:
+#   - path_prefix: "legacy/old_api/"
+#     rule: "openant/inconclusive"
+#     reason: "Legacy module scheduled for removal in Q3 2026; tracked in issue #42"
+#     added_by: "daniel"
+#     added_date: "2026-04-17"
+#
+# Suppress a CWE class project-wide (use sparingly):
+#   - rule: "CWE-312"
+#     reason: "Cleartext storage findings reviewed; all instances use encrypted backing stores"
+#     added_by: "daniel"
+#     added_date: "2026-04-17"

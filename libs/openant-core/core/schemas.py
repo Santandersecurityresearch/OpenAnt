@@ -128,6 +128,7 @@ class ScanResult:
     report_path: str | None = None
     summary_path: str | None = None
     dynamic_test_path: str | None = None
+    sca_results_path: str | None = None
     units_count: int = 0
     language: str = "unknown"
     metrics: AnalysisMetrics = field(default_factory=AnalysisMetrics)
@@ -148,6 +149,7 @@ class ScanResult:
             "report_path": self.report_path,
             "summary_path": self.summary_path,
             "dynamic_test_path": self.dynamic_test_path,
+            "sca_results_path": self.sca_results_path,
             "units_count": self.units_count,
             "language": self.language,
             "metrics": self.metrics.to_dict(),
@@ -208,6 +210,41 @@ class VerifyResult:
             "disagreed": self.disagreed,
             "confirmed_vulnerabilities": self.confirmed_vulnerabilities,
             "usage": self.usage.to_dict(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# SCA result
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ScaMetrics:
+    """Summary metrics from a software-composition analysis scan."""
+    manifests_found: int = 0
+    packages_checked: int = 0
+    pinned_packages: int = 0
+    vulnerable_packages: int = 0
+    total_advisories: int = 0
+    critical: int = 0
+    high: int = 0
+    moderate: int = 0
+    low: int = 0
+    unknown: int = 0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class ScaStepResult:
+    """Result of the SCA step in the scanner pipeline."""
+    sca_results_path: str
+    metrics: ScaMetrics = field(default_factory=ScaMetrics)
+
+    def to_dict(self) -> dict:
+        return {
+            "sca_results_path": self.sca_results_path,
+            "metrics": self.metrics.to_dict(),
         }
 
 

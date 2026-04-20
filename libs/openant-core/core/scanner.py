@@ -24,6 +24,7 @@ from pathlib import Path
 
 from core.schemas import (
     ScanResult, AnalysisMetrics, UsageInfo, StepReport,
+    ScaMetrics, ScaStepResult,
 )
 from core.step_report import step_context
 from core import tracking
@@ -102,6 +103,7 @@ def scan_repository(
     # Count total steps for progress display
     total_steps = _count_steps(
         generate_context, enhance, verify, generate_report, dynamic_test,
+        processing_level=processing_level,
     )
     step_num = 0
 
@@ -157,6 +159,23 @@ def scan_repository(
 
     # Active dataset path — may be updated by enhance step
     active_dataset_path = parse_result.dataset_path
+
+    # ---------------------------------------------------------------
+    # SCA branch — manifest parsing + OSV lookup (no LLM)
+    # Runs when processing_level == "sca"; also injects sca_results into
+    # pipeline_output for all other levels so dependency data is always
+    # available when present.
+    # ---------------------------------------------------------------
+    if processing_level == "sca":
+        return _run_sca_pipeline(
+            repo_path=repo_path,
+            output_dir=output_dir,
+            result=result,
+            collected_step_reports=collected_step_reports,
+            generate_report=generate_report,
+            step_num_ref=[step_num],
+            total_steps=total_steps,
+        )
 
     # ---------------------------------------------------------------
     # Step 2: Application Context (optional)
@@ -498,6 +517,298 @@ def scan_repository(
 
 
 # ---------------------------------------------------------------------------
+# SCA pipeline (--level sca)
+# ---------------------------------------------------------------------------
+
+def _run_sca_pipeline(
+    repo_path: str,
+    output_dir: str,
+    result: "ScanResult",
+    collected_step_reports: list[dict],
+    generate_report: bool,
+    step_num_ref: list[int],
+    total_steps: int,
+) -> "ScanResult":
+    """Run manifest parsing + OSV lookup and return a completed ScanResult.
+
+    Called when ``processing_level == "sca"``.  No LLM calls are made.
+    """
+    from core.manifest_parser import parse_manifests
+    from core.osv_client import query_packages
+
+    def _next_label(name: str) -> str:
+        step_num_ref[0] += 1
+        return f"[{step_num_ref[0]}/{total_steps}] {name}"
+
+    # ---------------------------------------------------------------- SCA scan
+    print(_next_label("Running SCA scan (manifest parsing + OSV lookup)…"),
+          file=sys.stderr)
+
+    sca_results_path = os.path.join(output_dir, "sca_results.json")
+
+    with step_context("sca-scan", output_dir, inputs={"repo_path": repo_path}) as ctx:
+        manifest_result = parse_manifests(repo_path)
+        osv_result      = query_packages(manifest_result.dependencies)
+
+        # Tally severity counts
+        sev_counts: dict[str, int] = {
+            "CRITICAL": 0, "HIGH": 0, "MODERATE": 0, "LOW": 0, "UNKNOWN": 0,
+        }
+        for pkg in osv_result.results:
+            for adv in pkg.advisories:
+                sev_counts[adv.severity] = sev_counts.get(adv.severity, 0) + 1
+
+        metrics = ScaMetrics(
+            manifests_found    = len(manifest_result.manifests_found),
+            packages_checked   = osv_result.packages_checked,
+            pinned_packages    = manifest_result.pinned_count,
+            vulnerable_packages= osv_result.vulnerable_packages,
+            total_advisories   = osv_result.total_advisories,
+            critical           = sev_counts.get("CRITICAL", 0),
+            high               = sev_counts.get("HIGH", 0),
+            moderate           = sev_counts.get("MODERATE", 0),
+            low                = sev_counts.get("LOW", 0),
+            unknown            = sev_counts.get("UNKNOWN", 0),
+        )
+
+        sca_output = {
+            "scan_type":  "sca",
+            "repo_path":  repo_path,
+            "metrics":    metrics.to_dict(),
+            "manifests":  manifest_result.manifests_found,
+            "findings":   osv_result.to_dict()["findings"],
+            "all_packages": [p.to_dict() for p in osv_result.results],
+            "parse_errors": manifest_result.errors,
+            "osv_errors":   osv_result.errors,
+        }
+
+        import json as _json
+        with open(sca_results_path, "w") as f:
+            _json.dump(sca_output, f, indent=2)
+
+        ctx.summary = {
+            "manifests_found":     metrics.manifests_found,
+            "packages_checked":    metrics.packages_checked,
+            "vulnerable_packages": metrics.vulnerable_packages,
+            "total_advisories":    metrics.total_advisories,
+            "severity_breakdown":  sev_counts,
+        }
+        ctx.outputs = {"sca_results_path": sca_results_path}
+
+    result.sca_results_path = sca_results_path
+    collected_step_reports.append(_load_step_report(output_dir, "sca-scan"))
+
+    print(f"  Manifests: {metrics.manifests_found} | "
+          f"Packages: {metrics.packages_checked} | "
+          f"Vulnerable: {metrics.vulnerable_packages} | "
+          f"Advisories: {metrics.total_advisories}",
+          file=sys.stderr)
+    print(file=sys.stderr)
+
+    # ---------------------------------------------------------------- pipeline_output.json
+    print(_next_label("Building pipeline_output.json…"), file=sys.stderr)
+
+    pipeline_output_path = os.path.join(output_dir, "pipeline_output.json")
+
+    with step_context("build-output", output_dir, inputs={}) as ctx:
+        _build_sca_pipeline_output(
+            sca_output=sca_output,
+            metrics=metrics,
+            output_path=pipeline_output_path,
+            repo_path=repo_path,
+            language=result.language,
+            step_reports=collected_step_reports,
+        )
+        ctx.outputs = {"pipeline_output_path": pipeline_output_path}
+
+    result.pipeline_output_path = pipeline_output_path
+    collected_step_reports.append(_load_step_report(output_dir, "build-output"))
+    print(file=sys.stderr)
+
+    # ---------------------------------------------------------------- Report (optional)
+    if generate_report:
+        print(_next_label("Generating SCA report…"), file=sys.stderr)
+        _write_sca_summary(sca_output, metrics, output_dir)
+        print(file=sys.stderr)
+    else:
+        print(_next_label("Skipping report generation (--no-report)."), file=sys.stderr)
+        result.skipped_steps.append("report")
+        print(file=sys.stderr)
+
+    # ---------------------------------------------------------------- Finalise
+    result.usage    = tracking.get_usage()
+    result.step_reports = collected_step_reports
+
+    # Map SCA metrics into AnalysisMetrics so the JSON envelope is consistent
+    result.metrics = AnalysisMetrics(
+        total      = metrics.packages_checked,
+        vulnerable = metrics.vulnerable_packages,
+    )
+
+    _write_scan_report(output_dir, result, collected_step_reports)
+    _print_sca_summary(metrics)
+    return result
+
+
+def _build_sca_pipeline_output(
+    sca_output: dict,
+    metrics: "ScaMetrics",
+    output_path: str,
+    repo_path: str,
+    language: str,
+    step_reports: list[dict],
+) -> None:
+    """Write a pipeline_output.json compatible with SARIF conversion for SCA results."""
+    from datetime import datetime, timezone
+
+    # Map OSV findings into the pipeline_output findings schema so
+    # sarif_convert.py and the PR comment machinery can consume them.
+    findings = []
+    for i, pkg_finding in enumerate(sca_output.get("findings", [])):
+        for adv in pkg_finding.get("advisories", []):
+            severity = adv.get("severity", "UNKNOWN")
+            verdict = {
+                "CRITICAL": "vulnerable",
+                "HIGH":     "vulnerable",
+                "MODERATE": "bypassable",
+                "LOW":      "inconclusive",
+                "UNKNOWN":  "inconclusive",
+            }.get(severity, "inconclusive")
+
+            findings.append({
+                "id":            f"SCA-{i+1:04d}",
+                "name":          adv.get("summary", "Vulnerable dependency"),
+                "short_name":    adv.get("osv_id", "sca-finding"),
+                "stage1_verdict": verdict,
+                "stage2_verdict": "not_applicable",
+                "location": {
+                    "file":     pkg_finding.get("manifest_file", ""),
+                    "function": f"{pkg_finding['name']}@{pkg_finding['version']}",
+                },
+                "cwe_id":   0,
+                "cwe_name": "Vulnerable Dependency",
+                "description": (
+                    f"{pkg_finding['name']}@{pkg_finding['version']} "
+                    f"({pkg_finding['ecosystem']}) — {adv.get('summary', '')}"
+                ),
+                "suggested_fix": (
+                    f"Upgrade to {adv['fixed_version']}"
+                    if adv.get("fixed_version") else "Check the advisory for remediation guidance"
+                ),
+                "sca": {
+                    "package":      pkg_finding["name"],
+                    "version":      pkg_finding["version"],
+                    "ecosystem":    pkg_finding["ecosystem"],
+                    "pinned":       pkg_finding.get("pinned", True),
+                    "osv_id":       adv.get("osv_id"),
+                    "aliases":      adv.get("aliases", []),
+                    "severity":     severity,
+                    "cvss_score":   adv.get("cvss_score"),
+                    "fixed_version": adv.get("fixed_version"),
+                    "url":          adv.get("url"),
+                },
+            })
+
+    import json as _json
+    pipeline_output = {
+        "repository": {
+            "name":    os.path.basename(repo_path),
+            "url":     "",
+            "language": language,
+        },
+        "analysis_date":    datetime.now(timezone.utc).isoformat(),
+        "application_type": "unknown",
+        "pipeline_stats": {
+            "total_units":      metrics.packages_checked,
+            "processing_level": "sca",
+            "scan_type":        "sca",
+        },
+        "metrics": {
+            "vulnerable":  metrics.vulnerable_packages,
+            "bypassable":  0,
+            "inconclusive": 0,
+            "safe":         metrics.packages_checked - metrics.vulnerable_packages,
+        },
+        "findings": findings,
+        "sca_summary": {
+            "manifests_found":     metrics.manifests_found,
+            "packages_checked":    metrics.packages_checked,
+            "pinned_packages":     metrics.pinned_packages,
+            "vulnerable_packages": metrics.vulnerable_packages,
+            "total_advisories":    metrics.total_advisories,
+            "severity_breakdown": {
+                "critical": metrics.critical,
+                "high":     metrics.high,
+                "moderate": metrics.moderate,
+                "low":      metrics.low,
+                "unknown":  metrics.unknown,
+            },
+        },
+    }
+
+    with open(output_path, "w") as f:
+        _json.dump(pipeline_output, f, indent=2)
+
+    print(f"[Report] pipeline_output.json written ({len(findings)} SCA findings).",
+          file=sys.stderr)
+
+
+def _write_sca_summary(sca_output: dict, metrics: "ScaMetrics", output_dir: str) -> None:
+    """Write a plain-text SCA summary report."""
+    lines = [
+        "=" * 60,
+        "OPENANT SCA REPORT",
+        "=" * 60,
+        "",
+        f"  Manifests scanned:  {metrics.manifests_found}",
+        f"  Packages checked:   {metrics.packages_checked}",
+        f"  Pinned packages:    {metrics.pinned_packages}",
+        f"  Vulnerable packages:{metrics.vulnerable_packages}",
+        f"  Total advisories:   {metrics.total_advisories}",
+        "",
+        "  Severity breakdown:",
+        f"    CRITICAL: {metrics.critical}",
+        f"    HIGH:     {metrics.high}",
+        f"    MODERATE: {metrics.moderate}",
+        f"    LOW:      {metrics.low}",
+        "",
+    ]
+
+    for pkg in sca_output.get("findings", []):
+        lines.append(
+            f"  [{pkg['ecosystem']}] {pkg['name']}@{pkg['version']} "
+            f"({pkg['advisory_count']} advisory/advisories)"
+        )
+        for adv in pkg.get("advisories", []):
+            cve = adv["aliases"][0] if adv.get("aliases") else adv["osv_id"]
+            fixed = f"  → fix: {adv['fixed_version']}" if adv.get("fixed_version") else ""
+            lines.append(
+                f"    {adv['severity']:8s} {cve}: {adv['summary'][:80]}{fixed}"
+            )
+        lines.append("")
+
+    summary_path = os.path.join(output_dir, "sca_summary.txt")
+    with open(summary_path, "w") as f:
+        f.write("\n".join(lines))
+    print(f"  SCA summary: {summary_path}", file=sys.stderr)
+
+
+def _print_sca_summary(metrics: "ScaMetrics") -> None:
+    print("=" * 60, file=sys.stderr)
+    print("SCA SCAN COMPLETE", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+    print(f"  Manifests found:    {metrics.manifests_found}", file=sys.stderr)
+    print(f"  Packages checked:   {metrics.packages_checked}", file=sys.stderr)
+    print(f"  Pinned packages:    {metrics.pinned_packages}", file=sys.stderr)
+    print(f"  Vulnerable:         {metrics.vulnerable_packages}", file=sys.stderr)
+    print(f"  Total advisories:   {metrics.total_advisories}", file=sys.stderr)
+    if metrics.total_advisories:
+        print(f"  Critical: {metrics.critical}  High: {metrics.high}  "
+              f"Moderate: {metrics.moderate}  Low: {metrics.low}", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -507,8 +818,13 @@ def _count_steps(
     verify: bool,
     generate_report: bool,
     dynamic_test: bool,
+    processing_level: str = "reachable",
 ) -> int:
-    """Count total steps for progress display (always includes parse, detect, build-output)."""
+    """Count total steps for progress display."""
+    if processing_level == "sca":
+        # parse + sca-scan + build-output; optionally report
+        return 3 + (1 if generate_report else 0)
+
     count = 3  # parse + detect + build-output (always run)
     if generate_context:
         count += 1

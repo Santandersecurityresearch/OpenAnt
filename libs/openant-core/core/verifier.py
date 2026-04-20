@@ -41,6 +41,7 @@ def run_verification(
     workers: int = 8,
     checkpoint_path: str | None = None,
     backoff_seconds: int = 30,
+    sca_context=None,
 ) -> VerifyResult:
     """Run Stage 2 attacker-simulation verification on Stage 1 results.
 
@@ -138,6 +139,7 @@ def run_verification(
         tracker=tracker,
         verbose=False,
         app_context=app_context,
+        sca_context=sca_context,
     )
 
     print(f"[Verify] Running Stage 2 attacker simulation on {findings_input} findings...",

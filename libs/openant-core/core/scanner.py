@@ -161,6 +161,26 @@ def scan_repository(
     active_dataset_path = parse_result.dataset_path
 
     # ---------------------------------------------------------------
+    # SCA context scan — always runs (fast, no LLM) to build the
+    # dep-context index injected into Stage 1 + Stage 2 prompts.
+    # Skipped only when processing_level == "sca" (which runs its own
+    # full SCA pipeline below).
+    # ---------------------------------------------------------------
+    sca_context = None
+    if processing_level != "sca":
+        sca_context = _build_sca_context(repo_path)
+        if sca_context:
+            print(
+                f"[SCA] Context built: {sca_context.vulnerable_package_count} vulnerable "
+                f"package(s), {len(sca_context.file_index)} file(s) with dep advisories.",
+                file=sys.stderr,
+            )
+        else:
+            print("[SCA] No vulnerable dependencies found — skipping dep context injection.",
+                  file=sys.stderr)
+        print(file=sys.stderr)
+
+    # ---------------------------------------------------------------
     # SCA branch — manifest parsing + OSV lookup (no LLM)
     # Runs when processing_level == "sca"; also injects sca_results into
     # pipeline_output for all other levels so dependency data is always
@@ -285,6 +305,7 @@ def scan_repository(
             model=model,
             workers=workers,
             backoff_seconds=backoff_seconds,
+            sca_context=sca_context,
         )
 
         ctx.summary = {
@@ -334,6 +355,7 @@ def scan_repository(
                 repo_path=repo_path,
                 workers=workers,
                 backoff_seconds=backoff_seconds,
+                sca_context=sca_context,
             )
 
             ctx.summary = {
@@ -514,6 +536,33 @@ def scan_repository(
     _print_summary(result)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# SCA context builder (runs for all non-sca levels)
+# ---------------------------------------------------------------------------
+
+def _build_sca_context(repo_path: str):
+    """Run manifest parsing + OSV lookup and return a ScaContext, or None on failure.
+
+    Runs silently on error so a network outage never blocks a code scan.
+    """
+    try:
+        from core.manifest_parser import parse_manifests
+        from core.osv_client import query_packages
+        from core.sca_context_builder import build_sca_context
+
+        manifest_result = parse_manifests(repo_path)
+        if not manifest_result.dependencies:
+            return None
+
+        osv_result = query_packages(manifest_result.dependencies)
+        return build_sca_context(repo_path, osv_result)
+
+    except Exception as exc:
+        print(f"[SCA] Warning: context scan failed ({exc}) — continuing without dep context.",
+              file=sys.stderr)
+        return None
 
 
 # ---------------------------------------------------------------------------

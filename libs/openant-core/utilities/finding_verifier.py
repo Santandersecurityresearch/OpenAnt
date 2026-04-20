@@ -265,11 +265,13 @@ class FindingVerifier:
         app_context: "ApplicationContext" = None,
         logger: logging.Logger = None,
         client: "anthropic.Anthropic | None" = None,
+        sca_context=None,
     ):
         self.index = index
         self.tracker = tracker or get_global_tracker()
         self.verbose = verbose
         self.app_context = app_context
+        self.sca_context = sca_context
         self.tool_executor = ToolExecutor(index)
         self.client = client or anthropic.Anthropic(max_retries=5)
         self.logger = logger or _null_logger
@@ -291,7 +293,8 @@ class FindingVerifier:
         finding: str,
         attack_vector: str,
         reasoning: str,
-        files_included: list = None
+        files_included: list = None,
+        dep_context: str = None,
     ) -> VerificationResult:
         """
         Validate a Stage 1 assessment with exploit path tracing.
@@ -312,7 +315,8 @@ class FindingVerifier:
             attack_vector=attack_vector,
             reasoning=reasoning,
             files_included=files_included,
-            app_context=self.app_context
+            app_context=self.app_context,
+            dep_context=dep_context,
         )
 
         # Get system prompt with app context if available
@@ -588,12 +592,20 @@ class FindingVerifier:
         detail = ""
         try:
             code = code_by_route.get(route_key, "")
+
+            # Resolve per-finding dep context (Layer 2 for Stage 2)
+            dep_context = None
+            if self.sca_context is not None:
+                file_path = route_key.split(":")[0] if ":" in route_key else route_key
+                dep_context = self.sca_context.get_file_dep_context(file_path)
+
             verification = self.verify_result(
                 code=code,
                 finding=stage1_finding,
                 attack_vector=result.get("attack_vector"),
                 reasoning=result.get("reasoning", ""),
-                files_included=result.get("files_included", [])
+                files_included=result.get("files_included", []),
+                dep_context=dep_context,
             )
 
             result["verification"] = verification.to_dict()

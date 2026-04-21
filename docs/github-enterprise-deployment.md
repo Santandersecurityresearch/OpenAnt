@@ -362,6 +362,70 @@ jobs:
 
 ---
 
+## Software Composition Analysis (SCA)
+
+OpenAnt automatically checks a repo's declared dependencies against
+[OSV.dev](https://osv.dev) — the open vulnerability database covering npm, PyPI,
+Go modules, crates.io, Maven, RubyGems, Packagist, and more. This happens on
+every scan with no extra configuration.
+
+### What it does
+
+When a scan starts, OpenAnt:
+
+1. Finds all manifest files in the repo (`package.json`, `requirements.txt`,
+   `go.mod`, `Cargo.toml`, `pom.xml`, `Gemfile.lock`, `composer.json`,
+   `pyproject.toml`)
+2. Batches the declared dependencies against the OSV.dev API
+3. Injects known CVE context into the LLM prompt for each file that imports
+   a vulnerable package
+
+The result is that the LLM already knows, before it reads a line of code, that
+(for example) `node-serialize 0.0.4` has a remote code execution CVE — so it
+can connect a deserialisation call in the code directly to that advisory rather
+than reasoning about it in the abstract. In testing on DVNA this surfaced the
+`node-serialize` RCE (CVE-2017-5941) and `mathjs` arbitrary code execution
+without any extra configuration.
+
+### SCA-only mode
+
+If you want dependency auditing without LLM analysis — useful as a cheap first
+pass or for repos where SAST is out of scope — use `--level sca`:
+
+```yaml
+- name: Run SCA-only scan
+  run: |
+    openant scan "$GITHUB_WORKSPACE" \
+      --level sca \
+      --language auto \
+      --output /tmp/openant-results
+```
+
+`--level sca` calls OSV.dev only — **no Anthropic API calls, no LLM cost**.
+Findings are written to `pipeline_output.json` in the same format as a full scan,
+so the SARIF conversion and Security tab upload steps work unchanged.
+
+### Supported manifests
+
+| Ecosystem | Files parsed |
+|-----------|-------------|
+| npm / Node | `package.json` |
+| Python | `requirements.txt`, `pyproject.toml` |
+| Go | `go.mod` |
+| Rust | `Cargo.toml` |
+| Java | `pom.xml` |
+| Ruby | `Gemfile.lock` |
+| PHP | `composer.json` |
+
+### Network requirement
+
+OSV.dev lookups require outbound HTTPS to `api.osv.dev`. On air-gapped GHES
+instances this must be explicitly allowed through the proxy/firewall.
+If it is unreachable, OpenAnt logs a warning and continues without SCA context —
+the scan does not fail.
+
+---
+
 ## Cost estimates
 
 These are approximate for Sonnet with Stage 2 verification enabled.
@@ -375,6 +439,7 @@ These are approximate for Sonnet with Stage 2 verification enabled.
 
 **Cost controls:**
 - `--level reachable` reduces units by ~94% vs `--level all`
+- `--level sca` runs dependency auditing only — zero LLM cost, good as a PR gate for supply chain risk
 - `--limit 50` caps spend on PR scans
 - Skip `--verify` on PRs and reserve Stage 2 for nightly runs to halve cost
 - Use `--model sonnet` (default); only upgrade to `--model opus` for targeted deep dives

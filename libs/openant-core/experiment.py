@@ -322,7 +322,9 @@ def analyze_unit(
     use_multifile: bool = False,
     json_corrector: JSONCorrector = None,
     context_reviewer: ContextReviewer = None,
-    app_context: "ApplicationContext" = None
+    app_context: "ApplicationContext" = None,
+    dep_context: str = None,
+    sca_repo_summary: str = None,
 ) -> dict:
     """
     Analyze a single code unit.
@@ -396,7 +398,9 @@ def analyze_unit(
         files_included=files_included,
         security_classification=security_classification,
         classification_reasoning=classification_reasoning,
-        app_context=app_context
+        app_context=app_context,
+        dep_context=dep_context,
+        sca_repo_summary=sca_repo_summary,
     )
 
     # Call Claude with system prompt for threat model awareness

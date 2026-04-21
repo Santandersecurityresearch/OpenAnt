@@ -82,6 +82,7 @@ def get_verification_prompt(
     reasoning: str,
     files_included: list = None,
     app_context: "ApplicationContext" = None,
+    dep_context: str = None,
 ) -> str:
     """
     Attacker simulation prompt with optional application context.
@@ -101,6 +102,15 @@ def get_verification_prompt(
     app_context_section = ""
     if app_context:
         app_context_section = format_app_context_for_verification(app_context) + "\n---\n\n"
+
+    # Build dependency context section
+    dep_context_section = ""
+    if dep_context:
+        dep_context_section = (
+            dep_context.rstrip()
+            + "\n\nConsider whether the advisory above creates an additional exploit path "
+            "or amplifies the existing finding.\n\n---\n\n"
+        )
 
     # Mark the target function clearly
     code_parts = code.split("// ========== File Boundary ==========")
@@ -138,7 +148,7 @@ Then the vulnerability is NOT EXPLOITABLE by you, because local users can alread
     else:
         attacker_description = """You are an attacker on the internet. You have a browser and nothing else. No server access, no admin credentials, no ability to modify files on the server."""
 
-    return f"""{app_context_section}Stage 1 claims this function is **{finding.upper()}**.
+    return f"""{app_context_section}{dep_context_section}Stage 1 claims this function is **{finding.upper()}**.
 
 Their reasoning: {reasoning}
 

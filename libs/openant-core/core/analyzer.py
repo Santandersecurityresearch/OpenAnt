@@ -46,7 +46,7 @@ except ImportError:
     load_context = None
 
 
-def _process_unit(client, unit, index, json_corrector, app_context):
+def _process_unit(client, unit, index, json_corrector, app_context, sca_context=None):
     """Process a single unit for Stage 1 detection.
 
     Returns a dict with all result data. Does not mutate shared state.
@@ -57,11 +57,25 @@ def _process_unit(client, unit, index, json_corrector, app_context):
     tracker.start_unit_tracking()
 
     try:
+        # Resolve per-unit dep context from the SCA index.
+        # Layer 2: file-specific advisory text if this file imports a vulnerable pkg.
+        # Layer 1: repo-level summary as fallback for files with no direct match.
+        dep_context = None
+        sca_repo_summary = None
+        if sca_context is not None:
+            uid = unit.get("id", "")
+            file_path = uid.split(":")[0] if ":" in uid else uid
+            dep_context = sca_context.get_file_dep_context(file_path)
+            if dep_context is None and sca_context.repo_summary:
+                sca_repo_summary = sca_context.repo_summary
+
         result = analyze_unit(
             client, unit,
             use_multifile=True,
             json_corrector=json_corrector,
             app_context=app_context,
+            dep_context=dep_context,
+            sca_repo_summary=sca_repo_summary,
         )
 
         # Ensure unit_id is always present
@@ -117,7 +131,7 @@ def _process_unit(client, unit, index, json_corrector, app_context):
 
 
 def _run_detection(units, client, json_corrector, app_context, workers,
-                   checkpoint=None, summary_callback=None):
+                   checkpoint=None, summary_callback=None, sca_context=None):
     """Run Stage 1 detection across all units.
 
     Uses ThreadPoolExecutor for parallel processing when workers > 1.
@@ -168,7 +182,7 @@ def _run_detection(units, client, json_corrector, app_context, workers,
             units_to_process.append((i, unit))
 
     def _process_and_save(i, unit):
-        out = _process_unit(client, unit, i, json_corrector, app_context)
+        out = _process_unit(client, unit, i, json_corrector, app_context, sca_context)
         # Save checkpoint
         if checkpoint is not None:
             uid = out["result"].get("unit_id", f"unit_{i}")
@@ -268,6 +282,7 @@ def run_analysis(
     workers: int = 8,
     checkpoint_path: str | None = None,
     backoff_seconds: int = 30,
+    sca_context=None,
 ) -> AnalyzeResult:
     """Run Stage 1 vulnerability detection on a dataset.
 
@@ -410,7 +425,7 @@ def run_analysis(
     # --- Stage 1: Detection ---
     results, code_by_route = _run_detection(
         units, client, json_corrector, app_context, workers, checkpoint=checkpoint,
-        summary_callback=_summary_callback,
+        summary_callback=_summary_callback, sca_context=sca_context,
     )
 
     # Auto-retry failed units with transient errors (rate limit, connection, timeout, 5xx)
